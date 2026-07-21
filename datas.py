@@ -4,14 +4,9 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 
-# --- 0. CONFIGURAZIONE PAGINA E INTESTAZIONE ---
-st.set_page_config(page_title="Energy Data Explorer", layout="wide")
-st.title("🌍 Energy Supply & Ember-Style Sankey")
-
-
 # --- 1. CONFIGURAZIONE PAGINA E INTESTAZIONE ---
 st.set_page_config(page_title="Energy Data Explorer", layout="wide")
-st.title("🌍 Energy Supply, Transizione & Sankey")
+st.title("🌍 Energy Supply & Ember-Style Sankey")
 
 st.markdown(
     "<div style='font-size:0.8em; color:#888; margin-top:-8px; margin-bottom:8px;'>"
