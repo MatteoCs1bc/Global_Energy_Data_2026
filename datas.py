@@ -304,8 +304,8 @@ with tab_sankey:
         nodes1 = ["Electro (Rinn/Idro)", "Termiche (Foss/Nuc/Bio)", "Elettroni", "Molecole", "Lavoro Utile", "Calore Utile", "Energia Persa"]
         colors1 = ['#22C55E', '#4B5563', '#FACC15', '#9CA3AF', '#3B82F6', '#F97316', 'rgba(239, 68, 68, 0.5)']
         
-        link_colors1 = ['#FACC15', 'rgba(239, 68, 68, 0.3)', '#FACC15', '#000000', 'rgba(239, 68, 68, 0.3)',
-                        '#FACC15', '#FACC15', 'rgba(239, 68, 68, 0.3)', '#000000', '#000000', 'rgba(239, 68, 68, 0.3)']
+        link_colors1 = ['#FACC15', 'rgba(239, 68, 68, 0.3)', '#FACC15', '#374151', 'rgba(239, 68, 68, 0.3)',
+                        '#FACC15', '#FACC15', 'rgba(239, 68, 68, 0.3)', '#374151', '#374151', 'rgba(239, 68, 68, 0.3)']
 
         fig_s1 = go.Figure(data=[go.Sankey(
             node=dict(pad=20, thickness=25, label=nodes1, color=colors1),
