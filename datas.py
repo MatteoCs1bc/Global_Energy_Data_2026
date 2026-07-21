@@ -21,7 +21,7 @@ st.markdown(
 
 # --- MAPPA COLORI ---
 color_map = {
-    'Coal': '#000000',        # Nero
+    'Coal': '#374151',        # Grigio
     'Oil': '#4B5563',         # Grigio medio
     'Natural Gas': '#9CA3AF', # Grigio chiaro
     'Nuclear': '#9333EA',     # Viola
