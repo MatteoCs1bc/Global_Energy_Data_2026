@@ -1,8 +1,10 @@
-import streamlit as st
-import pandas as pd
+import re
+
 import numpy as np
-import plotly.graph_objects as go
+import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
 
 # --- 1. CONFIGURAZIONE PAGINA E INTESTAZIONE ---
 st.set_page_config(page_title="Energy Data Explorer", layout="wide")
@@ -19,352 +21,577 @@ st.markdown(
     unsafe_allow_html=True
 )
 
+FILE_PATH = "EI-Stats-Review-ALL-data (1).xlsx"
+TWH_TO_EJ = 0.0036
+
 # --- MAPPA COLORI ---
 color_map = {
-    'Coal': '#000000',        # Grigio
-    'Oil': '#4B5563',         # Grigio medio
-    'Natural Gas': '#9CA3AF', # Grigio chiaro
-    'Nuclear': '#9333EA',     # Viola
-    'Hydro': '#3B82F6',       # Blu
-    'Solar': '#FACC15',       # Giallo
-    'Wind': '#22C55E',        # Verde
-    'Biomass/Geo': '#8B4513', # Marrone
-    'Other': '#D1D5DB'        # Grigio chiarissimo
+    'Coal': '#111827',
+    'Oil': '#4B5563',
+    'Natural Gas': '#9CA3AF',
+    'Nuclear': '#9333EA',
+    'Hydro': '#3B82F6',
+    'Solar': '#FACC15',
+    'Wind': '#22C55E',
+    'Biomass/Geo': '#8B4513',
+    'Biofuels': '#B45309',
+    'Other': '#D1D5DB',
+}
+fuel_it = {
+    'Coal': 'Carbone', 'Oil': 'Petrolio', 'Natural Gas': 'Gas', 'Nuclear': 'Nucleare',
+    'Hydro': 'Idro', 'Solar': 'Solare', 'Wind': 'Eolico', 'Biomass/Geo': 'Biomasse/Geo',
+    'Biofuels': 'Biocarburanti', 'Other': 'Altro (pompaggi, rifiuti)',
 }
 
-# --- 2. FUNZIONI DI CARICAMENTO DATI ---
+# --- AREE: nomi puliti, classificazione, etichette ---
+CONTINENTS = ['Total North America', 'Total S. & Cent. America', 'Total Europe', 'Total CIS',
+              'Total Middle East', 'Total Africa', 'Total Asia Pacific']
+ECON_GROUPS = ['OECD', 'Non-OECD', 'European Union']
+AREA_LABELS = {
+    'Total World': 'Mondo',
+    'Total North America': 'Nord America',
+    'Total S. & Cent. America': 'America Centrale e Meridionale',
+    'Total Europe': 'Europa',
+    'Total CIS': 'CSI (ex URSS)',
+    'Total Middle East': 'Medio Oriente',
+    'Total Africa': 'Africa',
+    'Total Asia Pacific': 'Asia Pacifico',
+    'OECD': 'OCSE',
+    'Non-OECD': 'Non-OCSE',
+    'European Union': 'Unione Europea',
+    'USSR': 'URSS (serie storica)',
+    'Central America': 'America Centrale',
+    'Other Caribbean': 'Altri Caraibi',
+    'Other South America': 'Altri Sud America',
+    'Other S. & Cent. America': 'Altri America Centro-Sud',
+    'Other Europe': 'Altri Europa',
+    'Other CIS': 'Altri CSI',
+    'Other Middle East': 'Altri Medio Oriente',
+    'Eastern Africa': 'Africa orientale',
+    'Middle Africa': 'Africa centrale',
+    'Western Africa': 'Africa occidentale',
+    'Other Northern Africa': 'Altri Nord Africa',
+    'Other Southern Africa': 'Altri Africa australe',
+    'Other Africa': 'Altri Africa',
+    'Other Asia Pacific': 'Altri Asia Pacifico',
+}
+NAME_ALIASES = {'Viet Nam': 'Vietnam'}
+
+
+def clean_region(name):
+    """Normalizza i nomi EI: spazi, 'of which:', simboli di nota (#, *, ^, ♦)."""
+    s = str(name).strip()
+    s = re.sub(r'^of which:\s*', '', s, flags=re.I)
+    s = re.sub(r'[\s#*^♦]+$', '', s).strip()
+    return NAME_ALIASES.get(s, s)
+
+
+def area_kind(r):
+    if r == 'Total World' or r in CONTINENTS or r in ECON_GROUPS:
+        return 'aggregate'
+    if r == 'USSR' or r.startswith('Other ') or r == 'Central America' or (
+            r.endswith(' Africa') and r != 'South Africa'):
+        return 'residual'
+    return 'country'
+
+
+def area_label(r):
+    return AREA_LABELS.get(r, r)
+
+
+# --- 2. CARICAMENTO DATI ---
+def _is_year(v):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return False
+    return f.is_integer() and 1900 < f <= 2100
+
+
+def parse_sheet(raw, val_name):
+    """Legge un foglio EI 'regioni x anni' trovando da solo la riga delle intestazioni.
+    Scarta le righe senza numeri (note a piè di pagina) e i blocchi ripetuti."""
+    hdr = None
+    for i in range(min(12, len(raw))):
+        if sum(_is_year(v) for v in raw.iloc[i, 1:]) >= 5:
+            hdr = i
+            break
+    if hdr is None:
+        return pd.DataFrame(columns=['Region', 'Year', val_name])
+    year_cols = {}
+    for j, v in enumerate(raw.iloc[hdr]):
+        if j > 0 and _is_year(v) and int(float(v)) not in year_cols.values():
+            year_cols[j] = int(float(v))  # solo la prima occorrenza (le altre sono tassi/quote)
+    body = raw.iloc[hdr + 1:, [0] + list(year_cols)].copy()
+    body.columns = ['Region'] + list(year_cols.values())
+    body = body.dropna(subset=['Region'])
+    vals = body.iloc[:, 1:].apply(pd.to_numeric, errors='coerce')
+    body = body[vals.notna().any(axis=1)]
+    body['Region'] = body['Region'].map(clean_region)
+    body = body.drop_duplicates(subset='Region', keep='first')
+    df = body.melt(id_vars='Region', var_name='Year', value_name=val_name)
+    df['Year'] = df['Year'].astype(int)
+    df[val_name] = pd.to_numeric(df[val_name], errors='coerce').fillna(0.0)
+    return df
+
+
+SHEETS = {
+    # Energia primaria (EJ). Metodo EI 2026: idro/solare/eolico = contenuto energetico
+    # dell'elettricità prodotta (1:1); nucleare con rendimento convenzionale 33%.
+    'tes_total': ('Total Energy Supply (TES) -EJ', 'EJ', None),
+    'Oil': ('Oil Consumption - EJ', 'EJ', 'Oil'),
+    'Natural Gas': ('Gas Consumption - EJ', 'EJ', 'Natural Gas'),
+    'Coal': ('Coal Consumption - EJ', 'EJ', 'Coal'),
+    'Nuclear': ('Nuclear Consumption - EJ', 'EJ', 'Nuclear'),
+    'Hydro': ('Hydro Consumption - EJ', 'EJ', 'Hydro'),
+    'Solar': ('Solar Consumption - EJ', 'EJ', 'Solar'),
+    'Wind': ('Wind Consumption - EJ', 'EJ', 'Wind'),
+    'Biomass/Geo': ('Geo Biomass Other - EJ', 'EJ', 'Biomass/Geo'),
+    'Biofuels': ('Biofuels consumption - PJ', 'EJ', 'Biofuels'),  # PJ -> EJ sotto
+    # Generazione elettrica (TWh). I fogli "... inputs - Elec generation" sono già
+    # generazione per fonte in TWh, non input di combustibile.
+    'el_Nuclear': ('Nuclear Generation - TWh', 'TWh', 'Nuclear'),
+    'el_Hydro': ('Hydro Generation - TWh', 'TWh', 'Hydro'),
+    'el_Solar': ('Solar Generation - TWh', 'TWh', 'Solar'),
+    'el_Wind': ('Wind Generation - TWh', 'TWh', 'Wind'),
+    'el_Biomass/Geo': ('Geo Biomass Other - TWh', 'TWh', 'Biomass/Geo'),
+    'el_Oil': ('Oil inputs - Elec generation ', 'TWh', 'Oil'),
+    'el_Natural Gas': ('Gas inputs - Elec generation', 'TWh', 'Natural Gas'),
+    'el_Coal': ('Coal inputs - Elec generation ', 'TWh', 'Coal'),
+    'el_Other': ('Other inputs - Elec generation', 'TWh', 'Other'),
+    'el_total': ('Electricity Generation - TWh', 'TWh_Total', None),
+    'emis': ('CO2e Emissions ', 'MtCO2e', None),
+    'tes_pc': ('TES per Capita', 'GJ_capita', None),
+    'cap_Solar': ('Solar Installed Capacity', 'MW', 'Solar'),
+    'cap_Wind': ('Wind Installed Capacity', 'MW', 'Wind'),
+}
+
+
 @st.cache_data
 def load_data():
-    file_path = "EI-Stats-Review-ALL-data (1).xlsx"
-    
-    def get_hist(sheet, val_name):
-        try:
-            df = pd.read_excel(file_path, sheet_name=sheet, skiprows=2)
-            df = df.rename(columns={df.columns[0]: 'Region'}).dropna(subset=['Region'])
-            cols = [c for c in df.columns if isinstance(c, (int, float)) and 1960 < c <= 2025]
-            df = df.melt(id_vars=['Region'], value_vars=cols, var_name='Year', value_name=val_name)
-            df[val_name] = pd.to_numeric(df[val_name], errors='coerce').fillna(0)
-            return df
-        except: return pd.DataFrame()
+    names = sorted({v[0] for v in SHEETS.values()})
+    raw = pd.read_excel(FILE_PATH, sheet_name=names, header=None)
+    out = {}
+    for key, (sheet, val, fuel) in SHEETS.items():
+        df = parse_sheet(raw[sheet], val)
+        if key == 'Biofuels':
+            df['EJ'] = df['EJ'] / 1000.0
+        if fuel:
+            df['Fuel'] = fuel
+        out[key] = df
+    prim_fuels = ['Oil', 'Natural Gas', 'Coal', 'Nuclear', 'Hydro', 'Solar', 'Wind', 'Biomass/Geo', 'Biofuels']
+    df_tes = pd.concat([out[f] for f in prim_fuels], ignore_index=True)
+    df_elec = pd.concat([out[k] for k in out if k.startswith('el_') and k != 'el_total'], ignore_index=True)
+    df_cap = pd.concat([out['cap_Solar'], out['cap_Wind']], ignore_index=True)
+    return df_tes, df_elec, out['el_total'], out['tes_total'], out['emis'], out['tes_pc'], df_cap
 
-    # Dati Primari (EJ)
-    tes_oil = get_hist('Oil Consumption - EJ', 'EJ').assign(Fuel='Oil')
-    tes_gas = get_hist('Gas Consumption - EJ', 'EJ').assign(Fuel='Natural Gas')
-    tes_coal = get_hist('Coal Consumption - EJ', 'EJ').assign(Fuel='Coal')
-    tes_nuc = get_hist('Nuclear Consumption - EJ', 'EJ').assign(Fuel='Nuclear')
-    tes_hyd = get_hist('Hydro Consumption - EJ', 'EJ').assign(Fuel='Hydro')
-    tes_sol = get_hist('Solar Consumption - EJ', 'EJ').assign(Fuel='Solar')
-    tes_win = get_hist('Wind Consumption - EJ', 'EJ').assign(Fuel='Wind')
-    tes_bio = get_hist('Geo Biomass Other - EJ', 'EJ').assign(Fuel='Biomass/Geo')
-    df_tes = pd.concat([tes_oil, tes_gas, tes_coal, tes_nuc, tes_hyd, tes_sol, tes_win, tes_bio])
 
-    # Dati Elettrici (TWh)
-    el_nuc = get_hist('Nuclear Generation - TWh', 'TWh').assign(Fuel='Nuclear')
-    el_hyd = get_hist('Hydro Generation - TWh', 'TWh').assign(Fuel='Hydro')
-    el_sol = get_hist('Solar Generation - TWh', 'TWh').assign(Fuel='Solar')
-    el_win = get_hist('Wind Generation - TWh', 'TWh').assign(Fuel='Wind')
-    el_bio = get_hist('Geo Biomass Other - TWh', 'TWh').assign(Fuel='Biomass/Geo')
-    el_tot = get_hist('Electricity Generation - TWh', 'TWh_Total')
-    
-    # Per i fossili storici usiamo un proxy proporzionale agli input
-    in_oil = get_hist('Oil inputs - Elec generation ', 'In_EJ').assign(Fuel='Oil')
-    in_gas = get_hist('Gas inputs - Elec generation', 'In_EJ').assign(Fuel='Natural Gas')
-    in_coal = get_hist('Coal inputs - Elec generation ', 'In_EJ').assign(Fuel='Coal')
-    df_in_fossils = pd.concat([in_oil, in_gas, in_coal])
-    
-    # Emissioni e Pro Capita
-    df_emis = get_hist('CO2e Emissions ', 'MtCO2e')
-    df_tes_pc = get_hist('TES per Capita', 'GJ_capita')
-    
-    # Capacità Installata
-    cap_sol = get_hist('Solar Installed Capacity', 'MW').assign(Fuel='Solar')
-    cap_win = get_hist('Wind Installed Capacity', 'MW').assign(Fuel='Wind')
-    df_cap = pd.concat([cap_sol, cap_win])
-
-    return df_tes, pd.concat([el_nuc, el_hyd, el_sol, el_win, el_bio]), el_tot, df_in_fossils, df_emis, df_tes_pc, df_cap
-
-df_tes, df_elec_ren, df_elec_tot, df_in_fossils, df_emis, df_tes_pc, df_cap = load_data()
+df_tes, df_elec, df_elec_tot, df_tes_tot, df_emis, df_tes_pc, df_cap = load_data()
 if df_tes.empty:
+    st.error("Impossibile leggere il file Excel dei dati.")
     st.stop()
 
 # --- 3. SIDEBAR: FILTRI ---
 st.sidebar.header("Impostazioni Analisi")
-is_aggregate = df_tes['Region'].str.contains('Total|World|Union|OECD|Non-OECD', case=False, na=False)
-view_type = st.sidebar.radio("Tipo di Area:", ("Stati Singoli", "Aggregati / Continenti"))
+all_regions = [r for r in df_tes_tot['Region'].unique()]
+countries = sorted([r for r in all_regions if area_kind(r) == 'country'])
+aggregates = [r for r in ['Total World'] + CONTINENTS + ECON_GROUPS if r in all_regions]
+residuals = sorted([r for r in all_regions if area_kind(r) == 'residual'], key=area_label)
 
-regions_list = df_tes[~is_aggregate]['Region'].unique() if view_type == "Stati Singoli" else df_tes[is_aggregate]['Region'].unique()
-selected_region = st.sidebar.selectbox("Seleziona Area:", sorted([r for r in regions_list if r != 'Other']))
+view_type = st.sidebar.radio("Tipo di Area:", ("Stati", "Continenti e aggregati", "Altre aree (residui EI)"))
+if view_type == "Stati":
+    options = countries
+    default = options.index('Italy') if 'Italy' in options else 0
+    help_txt = None
+elif view_type == "Continenti e aggregati":
+    options = aggregates
+    default = 0
+    help_txt = "Mondo, continenti EI e raggruppamenti economici (OCSE, Non-OCSE, UE)."
+else:
+    options = residuals
+    default = 0
+    help_txt = ("Gruppi residui dell'Energy Institute: paesi non riportati singolarmente "
+                "(es. 'Altri Europa') e serie storiche (URSS).")
+
+selected_region = st.sidebar.selectbox("Seleziona Area:", options, index=default,
+                                       format_func=area_label, help=help_txt)
+region_label = area_label(selected_region)
 
 min_year, max_year = int(df_tes['Year'].min()), int(df_tes['Year'].max())
 selected_year = st.sidebar.slider("Seleziona Anno:", min_value=min_year, max_value=max_year, value=max_year)
+st.sidebar.caption("Fonte: Energy Institute, *Statistical Review of World Energy* 2026. "
+                   "Dati elettrici dal 1985, emissioni CO2e dal 1990.")
 
-# --- 4. PREPARAZIONE DATI PER L'ANNO SELEZIONATO ---
-def get_region_year(df, val_col):
-    res = df[(df['Region'] == selected_region) & (df['Year'] == selected_year)]
-    return res if not res.empty else pd.DataFrame(columns=df.columns)
 
-r_tes = get_region_year(df_tes, 'EJ')
-r_elec_ren = get_region_year(df_elec_ren, 'TWh')
-r_elec_tot_val = get_region_year(df_elec_tot, 'TWh_Total')['TWh_Total'].sum()
-r_in_fossils = get_region_year(df_in_fossils, 'In_EJ')
-r_emis_val = get_region_year(df_emis, 'MtCO2e')['MtCO2e'].sum()
-r_pc_val = get_region_year(df_tes_pc, 'GJ_capita')['GJ_capita'].sum()
-r_cap = get_region_year(df_cap, 'MW')
+# --- 4. PREPARAZIONE DATI ---
+def get_region_year(df):
+    return df[(df['Region'] == selected_region) & (df['Year'] == selected_year)]
 
-# Ricostruzione Elettricità Fossile
-ren_elec_twh = r_elec_ren['TWh'].sum()
-fossil_elec_twh = max(0, r_elec_tot_val - ren_elec_twh)
-tot_in_fossil = r_in_fossils['In_EJ'].sum()
 
-elec_mix_rows = r_elec_ren.copy()
-if tot_in_fossil > 0 and fossil_elec_twh > 0:
-    for fuel in ['Oil', 'Natural Gas', 'Coal']:
-        fuel_in = r_in_fossils[r_in_fossils['Fuel'] == fuel]['In_EJ'].sum()
-        fuel_twh = fossil_elec_twh * (fuel_in / tot_in_fossil)
-        elec_mix_rows = pd.concat([elec_mix_rows, pd.DataFrame([{'Region': selected_region, 'Year': selected_year, 'TWh': fuel_twh, 'Fuel': fuel}])])
+def elec_history(region):
+    """Mix elettrico (TWh) per fonte e anno, direttamente dai fogli EI.
+    Solo gli anni con generazione totale disponibile (dal 1985): prima mancano i fossili."""
+    ok_years = df_elec_tot[(df_elec_tot['Region'] == region) & (df_elec_tot['TWh_Total'] > 0)]['Year']
+    d = df_elec[(df_elec['Region'] == region) & (df_elec['Year'].isin(ok_years))]
+    return d.groupby(['Year', 'Fuel'], as_index=False)['TWh'].sum()
 
-primary_total_ej = r_tes['EJ'].sum()
 
-# Calcolo Popolazione e Pro Capita
+r_tes = get_region_year(df_tes)
+r_tes = r_tes[r_tes['EJ'] > 0]
+primary_total_ej = get_region_year(df_tes_tot)['EJ'].sum() or r_tes['EJ'].sum()
+r_elec_tot_val = get_region_year(df_elec_tot)['TWh_Total'].sum()
+r_emis_val = get_region_year(df_emis)['MtCO2e'].sum()
+r_pc_val = get_region_year(df_tes_pc)['GJ_capita'].sum()
+r_cap = get_region_year(df_cap).copy()
+
+elec_hist = elec_history(selected_region)
+elec_mix_rows = elec_hist[(elec_hist['Year'] == selected_year) & (elec_hist['TWh'] > 0)]
+
+# Popolazione dedotta da TES / TES pro capite
 population_millions = (primary_total_ej * 1e9 / r_pc_val / 1e6) if r_pc_val > 0 else 0
-elec_per_capita_mwh = (r_elec_tot_val * 1e6 / population_millions) if population_millions > 0 else 0
+elec_per_capita_mwh = (r_elec_tot_val / population_millions) if population_millions > 0 else 0  # TWh/Mpers = MWh/pers
 emis_per_capita_t = (r_emis_val / population_millions) if population_millions > 0 else 0
 
-st.header(f"Analisi: {selected_region} ({selected_year})")
+st.header(f"Analisi: {region_label} ({selected_year})")
+if primary_total_ej <= 0:
+    st.warning(f"Nessun dato di energia primaria per {region_label} nel {selected_year}. "
+               "Prova un altro anno: alcune serie (es. URSS) coprono solo alcuni periodi.")
 
-# Metriche
 m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Energia Primaria", f"{primary_total_ej:.1f} EJ")
-m2.metric("Gen. Elettrica", f"{r_elec_tot_val:.1f} TWh")
-m3.metric("Emissioni CO2e", f"{r_emis_val:.1f} Mt")
-m4.metric("Primaria pro capite", f"{r_pc_val:.1f} GJ/cap")
-m5.metric("Elettricità pro capite", f"{elec_per_capita_mwh:.1f} MWh/cap")
+m2.metric("Gen. Elettrica", f"{r_elec_tot_val:.1f} TWh" if r_elec_tot_val else "n.d.")
+m3.metric("Emissioni CO2e", f"{r_emis_val:.1f} Mt" if r_emis_val else "n.d.")
+m4.metric("Primaria pro capite", f"{r_pc_val:.1f} GJ/cap" if r_pc_val else "n.d.")
+m5.metric("Elettricità pro capite", f"{elec_per_capita_mwh:.1f} MWh/cap" if elec_per_capita_mwh else "n.d.")
 st.divider()
 
-# --- TABS ---
 tab_stat, tab_trend, tab_sankey = st.tabs(["📊 Statistiche & Capacità", "📈 Trend, Marchetti & Ternary", "🔄 Sankeys Termodinamici"])
 
 # --- TAB 1: STATISTICHE ---
 with tab_stat:
     c1, c2, c3 = st.columns(3)
-    
     with c1:
         st.subheader("Domanda Primaria (EJ)")
         if not r_tes.empty:
-            fig_tes = px.pie(r_tes, values='EJ', names='Fuel', hole=0.4, color='Fuel', color_discrete_map=color_map)
+            fig_tes = px.pie(r_tes.assign(Fonte=r_tes['Fuel'].map(fuel_it)), values='EJ', names='Fonte', hole=0.4,
+                             color='Fuel', color_discrete_map=color_map)
             fig_tes.update_layout(showlegend=False)
-            st.plotly_chart(fig_tes, use_container_width=True)
-            
+            st.plotly_chart(fig_tes, width='stretch')
+        else:
+            st.info("Dati non disponibili.")
     with c2:
         st.subheader("Produzione Elettrica (TWh)")
         if not elec_mix_rows.empty:
-            fig_elec = px.bar(elec_mix_rows, x='Fuel', y='TWh', color='Fuel', color_discrete_map=color_map)
-            fig_elec.update_layout(showlegend=False)
-            st.plotly_chart(fig_elec, use_container_width=True)
-            
+            em = elec_mix_rows.sort_values('TWh', ascending=False).assign(Fonte=lambda d: d['Fuel'].map(fuel_it))
+            fig_elec = px.bar(em, x='Fonte', y='TWh', color='Fuel', color_discrete_map=color_map)
+            fig_elec.update_layout(showlegend=False, xaxis_title=None)
+            st.plotly_chart(fig_elec, width='stretch')
+        else:
+            st.info("Dati elettrici non disponibili per l'anno selezionato (serie dal 1985).")
     with c3:
         st.subheader("Capacità Installata (GW)")
         if not r_cap.empty and r_cap['MW'].sum() > 0:
             r_cap['GW'] = r_cap['MW'] / 1000
-            fig_cap = px.bar(r_cap, x='Fuel', y='GW', color='Fuel', color_discrete_map=color_map)
-            fig_cap.update_layout(showlegend=False)
-            st.plotly_chart(fig_cap, use_container_width=True)
+            fig_cap = px.bar(r_cap.assign(Fonte=r_cap['Fuel'].map(fuel_it)), x='Fonte', y='GW',
+                             color='Fuel', color_discrete_map=color_map)
+            fig_cap.update_layout(showlegend=False, xaxis_title=None)
+            st.plotly_chart(fig_cap, width='stretch')
         else:
-            st.info("Dati di capacità Eolica/Solare non disponibili per l'anno selezionato.")
+            st.info("Dati di capacità Eolica/Solare non disponibili per l'area o l'anno selezionati (serie dal 2000).")
 
 # --- TAB 2: TREND, MARCHETTI E TERNARIO ---
 with tab_trend:
-    st.subheader("Emissioni Storiche e Intensità (MtCO2e)")
-    df_em_reg = df_emis[df_emis['Region'] == selected_region]
+    st.subheader("Emissioni Storiche (MtCO2e)")
+    df_em_reg = df_emis[(df_emis['Region'] == selected_region) & (df_emis['MtCO2e'] > 0)]
     if not df_em_reg.empty:
         fig_em = px.area(df_em_reg, x='Year', y='MtCO2e', color_discrete_sequence=['#4B5563'])
-        st.plotly_chart(fig_em, use_container_width=True)
+        st.plotly_chart(fig_em, width='stretch')
+    else:
+        st.info("Emissioni non disponibili per quest'area.")
 
     st.divider()
     c_m1, c_m2 = st.columns(2)
-    
+    df_tes_h = df_tes[df_tes['Region'] == selected_region].copy()
+
     with c_m1:
         st.subheader("Sostituzione Fonti Primarie (Marchetti)")
         st.markdown("Asse Y: $log_{10}(f / (1-f))$ dove $f$ è la quota di mercato.")
-        df_tes_h = df_tes[df_tes['Region'] == selected_region].copy()
         if not df_tes_h.empty:
-            tot_y = df_tes_h.groupby('Year')['EJ'].sum().reset_index().rename(columns={'EJ':'Total'})
-            df_tes_h = pd.merge(df_tes_h, tot_y, on='Year')
-            df_tes_h = df_tes_h[df_tes_h['Total'] > 0]
-            df_tes_h['f'] = np.clip(df_tes_h['EJ'] / df_tes_h['Total'], 0.0001, 0.9999)
-            df_tes_h['Marchetti'] = np.log10(df_tes_h['f'] / (1 - df_tes_h['f']))
-            fig_m1 = px.line(df_tes_h, x='Year', y='Marchetti', color='Fuel', color_discrete_map=color_map)
+            tot_y = df_tes_h.groupby('Year')['EJ'].sum().rename('Total').reset_index()
+            d = pd.merge(df_tes_h, tot_y, on='Year')
+            d = d[(d['Total'] > 0) & (d['EJ'] > 0)]
+            d['f'] = np.clip(d['EJ'] / d['Total'], 0.0001, 0.9999)
+            d['Marchetti'] = np.log10(d['f'] / (1 - d['f']))
+            fig_m1 = px.line(d, x='Year', y='Marchetti', color='Fuel', color_discrete_map=color_map)
             fig_m1.update_layout(yaxis_title="log(f / 1-f)")
-            st.plotly_chart(fig_m1, use_container_width=True)
+            st.plotly_chart(fig_m1, width='stretch')
 
     with c_m2:
         st.subheader("Evoluzione Mix Elettrico (Marchetti)")
         st.markdown("Competizione tra le fonti nella generazione elettrica.")
-        df_elec_ren_h = df_elec_ren[df_elec_ren['Region'] == selected_region].copy()
-        df_elec_tot_h = df_elec_tot[df_elec_tot['Region'] == selected_region].copy()
-        df_in_foss_h = df_in_fossils[df_in_fossils['Region'] == selected_region].copy()
-        
-        if not df_elec_ren_h.empty and not df_elec_tot_h.empty:
-            merged_elec_h = []
-            for y in df_elec_tot_h['Year'].unique():
-                tot_e = df_elec_tot_h[df_elec_tot_h['Year']==y]['TWh_Total'].sum()
-                ren_y = df_elec_ren_h[df_elec_ren_h['Year']==y]
-                foss_in_y = df_in_foss_h[df_in_foss_h['Year']==y]
-                
-                ren_twh = ren_y['TWh'].sum()
-                foss_twh = max(0, tot_e - ren_twh)
-                tot_in = foss_in_y['In_EJ'].sum()
-                
-                for _, row in ren_y.iterrows():
-                    merged_elec_h.append({'Year': y, 'Fuel': row['Fuel'], 'TWh': row['TWh']})
-                
-                if tot_in > 0 and foss_twh > 0:
-                    for _, row in foss_in_y.iterrows():
-                        merged_elec_h.append({'Year': y, 'Fuel': row['Fuel'], 'TWh': foss_twh * (row['In_EJ']/tot_in)})
-                        
-            df_elec_hist_full = pd.DataFrame(merged_elec_h)
-            tot_e_y = df_elec_hist_full.groupby('Year')['TWh'].sum().reset_index().rename(columns={'TWh':'Total'})
-            df_elec_hist_full = pd.merge(df_elec_hist_full, tot_e_y, on='Year')
-            df_elec_hist_full = df_elec_hist_full[df_elec_hist_full['Total'] > 0]
-            df_elec_hist_full['f'] = np.clip(df_elec_hist_full['TWh'] / df_elec_hist_full['Total'], 0.0001, 0.9999)
-            df_elec_hist_full['Marchetti'] = np.log10(df_elec_hist_full['f'] / (1 - df_elec_hist_full['f']))
-            
-            fig_m2 = px.line(df_elec_hist_full, x='Year', y='Marchetti', color='Fuel', color_discrete_map=color_map)
+        d = elec_hist[elec_hist['TWh'] > 0].copy()
+        if not d.empty:
+            d = d.merge(d.groupby('Year')['TWh'].sum().rename('Total').reset_index(), on='Year')
+            d['f'] = np.clip(d['TWh'] / d['Total'], 0.0001, 0.9999)
+            d['Marchetti'] = np.log10(d['f'] / (1 - d['f']))
+            fig_m2 = px.line(d, x='Year', y='Marchetti', color='Fuel', color_discrete_map=color_map)
             fig_m2.update_layout(yaxis_title="log(f / 1-f)")
-            st.plotly_chart(fig_m2, use_container_width=True)
+            st.plotly_chart(fig_m2, width='stretch')
 
     st.subheader("La rotta verso l'Elettrificazione (Ternary Plot)")
-    st.markdown("Quota stimata della domanda: Fossili, Elettroni e Biomassa/Altro (Ember Style).")
+    st.markdown("Quote dell'energia primaria: Fossili, fonti 'elettriche' (nucleare, idro, solare, eolico) "
+                "e Biomasse/Altro. Metodo EI: rinnovabili elettriche contate 1:1, nucleare a rendimento 33%.")
     if not df_tes_h.empty:
-        pivot_df = df_tes_h.pivot_table(index='Year', columns='Fuel', values='EJ', aggfunc='sum').fillna(0)
-        pivot_df['Total'] = pivot_df.sum(axis=1)
-        pivot_df['Fossil'] = pivot_df.get('Coal',0) + pivot_df.get('Natural Gas',0) + pivot_df.get('Oil',0)
-        pivot_df['Bio & Other'] = pivot_df.get('Biomass/Geo',0)
-        pivot_df['Electrons'] = pivot_df.get('Nuclear',0) + pivot_df.get('Hydro',0) + pivot_df.get('Solar',0) + pivot_df.get('Wind',0)
-        
+        p = df_tes_h.pivot_table(index='Year', columns='Fuel', values='EJ', aggfunc='sum').fillna(0)
+        p['Total'] = p.sum(axis=1)
+        p = p[p['Total'] > 0]
+        g = lambda c: p[c] if c in p else 0
+        p['Fossil'] = g('Coal') + g('Natural Gas') + g('Oil')
+        p['Bio & Other'] = g('Biomass/Geo') + g('Biofuels')
+        p['Electrons'] = g('Nuclear') + g('Hydro') + g('Solar') + g('Wind')
         for col in ['Fossil', 'Bio & Other', 'Electrons']:
-            pivot_df[col] = pivot_df[col] / pivot_df['Total'] * 100
-            
-        pivot_df = pivot_df.reset_index()
-        fig_t = px.scatter_ternary(pivot_df, a="Fossil", b="Electrons", c="Bio & Other", hover_name="Year", color="Year")
+            p[col] = p[col] / p['Total'] * 100
+        p = p.reset_index()
+        fig_t = px.scatter_ternary(p, a="Fossil", b="Electrons", c="Bio & Other", hover_name="Year", color="Year")
         fig_t.update_traces(mode="lines+markers", line=dict(color='#22C55E', width=2), marker=dict(size=6))
-        st.plotly_chart(fig_t, use_container_width=True)
+        st.plotly_chart(fig_t, width='stretch')
+
 
 # --- TAB 3: SANKEYS ---
+def rgba(hex_color, alpha):
+    h = hex_color.lstrip('#')
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+LOSS = '#EF4444'
+ELEC = '#EAB308'
+MOL = '#6B7280'
+
+
+class SankeyBuilder:
+    """Costruisce un Sankey a colonne fisse, salta flussi nulli, etichette con EJ e %."""
+
+    def __init__(self, ref_total, fixed=False):
+        self.fixed = fixed
+        self.ref = ref_total if ref_total > 0 else 1
+        self.nodes, self.links = {}, []
+
+    def node(self, key, label, color, col, order):
+        self.nodes.setdefault(key, dict(label=label, color=color, col=col, order=order))
+
+    def link(self, s, t, v, color):
+        if v is not None and v > 1e-4:
+            self.links.append((s, t, float(v), color))
+
+    def figure(self, height, n_cols):
+        # ordine dei flussi = ordine verticale dei nodi: riduce gli incroci
+        nd = self.nodes
+        self.links.sort(key=lambda l: (nd[l[0]]['col'], nd[l[0]]['order'], nd[l[1]]['col'], nd[l[1]]['order']))
+        used = [k for k in self.nodes if any(k in (l[0], l[1]) for l in self.links)]
+        idx = {k: i for i, k in enumerate(used)}
+        val = {k: max(sum(l[2] for l in self.links if l[1] == k), sum(l[2] for l in self.links if l[0] == k))
+               for k in used}
+        # posizioni: colonne fisse, nodi impilati per ordine dichiarato
+        xs, ys = {}, {}
+        for c in range(n_cols):
+            col_nodes = sorted([k for k in used if self.nodes[k]['col'] == c], key=lambda k: self.nodes[k]['order'])
+            tot = sum(val[k] for k in col_nodes) or 1
+            gap = 0.04
+            span = 1 - gap * max(len(col_nodes) - 1, 0)
+            y = 0.0
+            for k in col_nodes:
+                h = val[k] / tot * span
+                xs[k] = 0.001 if c == 0 else (0.999 if c == n_cols - 1 else c / (n_cols - 1))
+                ys[k] = min(max(y + h / 2, 0.01), 0.985)
+                y += h + gap
+        labels, hover = [], []
+        for k in used:
+            n = self.nodes[k]
+            pct = val[k] / self.ref * 100
+            v_txt = f"{val[k]:.1f}" if val[k] >= 1 else f"{val[k]:.2f}"
+            labels.append(f"{n['label']}  {v_txt} EJ ({pct:.0f}%)")
+            hover.append(f"<b>{n['label']}</b><br>{val[k]:.2f} EJ — {pct:.1f}% della primaria")
+        fig = go.Figure(go.Sankey(
+            arrangement='fixed' if self.fixed else 'snap',
+            valueformat='.2f', valuesuffix=' EJ',
+            node=dict(pad=18, thickness=18, label=labels, align='left', color=[self.nodes[k]['color'] for k in used],
+                      **(dict(x=[xs[k] for k in used], y=[ys[k] for k in used]) if self.fixed else {}),
+                      customdata=hover, hovertemplate='%{customdata}<extra></extra>',
+                      line=dict(width=0)),
+            link=dict(source=[idx[l[0]] for l in self.links], target=[idx[l[1]] for l in self.links],
+                      value=[l[2] for l in self.links], color=[l[3] for l in self.links],
+                      customdata=[[self.nodes[l[0]]['label'], self.nodes[l[1]]['label']] for l in self.links],
+                      hovertemplate='%{customdata[0]} → %{customdata[1]}<br><b>%{value:.2f} EJ</b><extra></extra>'),
+        ))
+        fig.update_traces(textfont=dict(size=13, color='#111827', shadow='1px 1px 2px white, -1px -1px 2px white'))
+        fig.update_layout(height=height, margin=dict(t=30, b=30, l=10, r=10))
+        return fig
+
+
 with tab_sankey:
-    if not elec_mix_rows.empty and not r_tes.empty:
-        def get_val(df, col_name, fuel, default=0):
-            val = df[df['Fuel'] == fuel][col_name].sum()
-            return val if pd.notnull(val) else default
+    if elec_mix_rows.empty or r_tes.empty:
+        st.info("Per i Sankey servono sia l'energia primaria sia il mix elettrico: "
+                "dati elettrici disponibili dal 1985 e non per tutte le aree residue.")
+    else:
+        st.markdown(
+            "**Come leggere i diagrammi.** Da sinistra a destra: fonti primarie → vettori "
+            "(elettricità e combustibili usati direttamente) → usi finali. Ogni nodo riporta EJ e "
+            "quota sull'energia primaria. I flussi **rossi** (in basso) sono perdite. "
+            "I dati primari ed elettrici sono EI; rendimenti e ripartizioni a valle sono **ipotesi** "
+            "modificabili qui sotto e uguali per tutti i paesi."
+        )
+        with st.expander("⚙️ Ipotesi del modello", expanded=False):
+            a1, a2, a3 = st.columns(3)
+            with a1:
+                st.markdown("**Rendimento centrali fossili**")
+                eta = {
+                    'Coal': st.slider("Carbone", 0.25, 0.50, 0.37, 0.01),
+                    'Natural Gas': st.slider("Gas", 0.30, 0.60, 0.45, 0.01),
+                    'Oil': st.slider("Petrolio", 0.25, 0.50, 0.33, 0.01),
+                }
+                st.caption("Nucleare e biomasse/geo: input = consumo primario EI. "
+                           "Idro/solare/eolico: 1:1 (metodo EI).")
+            with a2:
+                st.markdown("**Perdite a monte degli usi finali**")
+                grid_loss = st.slider("Rete e autoconsumi elettrici", 0.0, 0.20, 0.08, 0.01)
+                mol_up_loss = st.slider("Filiera combustibili (raffinazione, trasporto, autoconsumi)", 0.0, 0.30, 0.15, 0.01)
+                non_energy = st.slider("Combustibili per usi non energetici (materia prima)", 0.0, 0.30, 0.12, 0.01)
+            with a3:
+                st.markdown("**Rendimento negli usi finali**")
+                el_work_share = st.slider("Elettricità: quota per lavoro/servizi", 0.0, 1.0, 0.77, 0.01)
+                el_work_eff = st.slider("Elettricità: rendimento lavoro", 0.3, 1.0, 0.68, 0.01)
+                el_heat_eff = st.slider("Elettricità: rendimento calore", 0.5, 4.0, 0.91, 0.01,
+                                        help="Valori >1 rappresentano pompe di calore (COP).")
+                mol_work_share = st.slider("Combustibili: quota per lavoro (motori)", 0.0, 1.0, 0.48, 0.01)
+                mol_work_eff = st.slider("Combustibili: rendimento lavoro", 0.1, 0.6, 0.29, 0.01)
+                mol_heat_eff = st.slider("Combustibili: rendimento calore", 0.3, 1.0, 0.64, 0.01)
+            st.markdown("**Ripartizione per settore (diagramma 2)**")
+            b1, b2 = st.columns(2)
+            with b1:
+                st.caption("Elettricità finale (%)")
+                e_tr = st.number_input("Trasporti", 0, 100, 2, key='e_tr')
+                e_in = st.number_input("Industria", 0, 100, 43, key='e_in')
+                e_bu = st.number_input("Edifici/Civile", 0, 100, 55, key='e_bu')
+            with b2:
+                st.caption("Combustibili finali, usi energetici (%)")
+                m_tr = st.number_input("Trasporti", 0, 100, 45, key='m_tr')
+                m_in = st.number_input("Industria", 0, 100, 33, key='m_in')
+                m_bu = st.number_input("Edifici/Civile", 0, 100, 22, key='m_bu')
 
-        # Estrazione Valori
-        pe_hydro = get_val(r_tes, 'EJ', 'Hydro')
-        pe_solar = get_val(r_tes, 'EJ', 'Solar')
-        pe_wind = get_val(r_tes, 'EJ', 'Wind')
-        pe_bio = get_val(r_tes, 'EJ', 'Biomass/Geo')
-        pe_nuc = get_val(r_tes, 'EJ', 'Nuclear')
-        pe_coal = get_val(r_tes, 'EJ', 'Coal')
-        pe_oil = get_val(r_tes, 'EJ', 'Oil')
-        pe_gas = get_val(r_tes, 'EJ', 'Natural Gas')
-        
-        el_hydro = get_val(elec_mix_rows, 'TWh', 'Hydro') * 0.0036
-        el_solar = get_val(elec_mix_rows, 'TWh', 'Solar') * 0.0036
-        el_wind = get_val(elec_mix_rows, 'TWh', 'Wind') * 0.0036
-        el_bio = get_val(elec_mix_rows, 'TWh', 'Biomass/Geo') * 0.0036
-        el_nuc = get_val(elec_mix_rows, 'TWh', 'Nuclear') * 0.0036
-        el_coal = get_val(elec_mix_rows, 'TWh', 'Coal') * 0.0036
-        el_oil = get_val(elec_mix_rows, 'TWh', 'Oil') * 0.0036
-        el_gas = get_val(elec_mix_rows, 'TWh', 'Natural Gas') * 0.0036
+        def norm(*v):
+            s = sum(v)
+            return [x / s for x in v] if s > 0 else [1 / len(v)] * len(v)
 
-        pe_electro = pe_hydro + pe_solar + pe_wind
-        pe_therm = pe_coal + pe_oil + pe_gas + pe_nuc + pe_bio
-        
-        elec_from_electro = el_hydro + el_solar + el_wind
-        elec_from_thermal = el_coal + el_oil + el_gas + el_nuc + el_bio
-        
-        eff_el, eff_th = 0.92, 0.29
-        
-        in_el = min(pe_electro, elec_from_electro / eff_el) if elec_from_electro > 0 else 0
-        w_el = max(0, in_el - elec_from_electro)
-        in_th = elec_from_thermal / eff_th if elec_from_thermal > 0 else 0
-        w_th = max(0, in_th - elec_from_thermal)
-        
-        mol_in = max(0, pe_therm - in_th)
-        f_mol = mol_in * 0.85
-        w_mol = mol_in * 0.15
-        
-        el_tot = elec_from_electro + elec_from_thermal
-        el_w, el_h = el_tot * 0.77, el_tot * 0.23
-        mol_w, mol_h = f_mol * 0.48, f_mol * 0.52
-        
-        w_end = (el_w * 0.32) + (el_h * 0.09) + (mol_w * 0.71) + (mol_h * 0.36)
-        
-        # --- 1. SANKEY EMBER (Primaria -> Utile) ---
-        st.subheader("1. Flusso Primaria -> Energia Utile")
-        nodes1 = ["Electro (Rinn/Idro)", "Termiche (Foss/Nuc/Bio)", "Elettroni", "Molecole", "Lavoro Utile", "Calore Utile", "Energia Persa"]
-        colors1 = ['#22C55E', '#4B5563', '#FACC15', '#9CA3AF', '#3B82F6', '#F97316', 'rgba(239, 68, 68, 0.5)']
-        
-        link_colors1 = ['#FACC15', 'rgba(239, 68, 68, 0.3)', '#FACC15', '#374151', 'rgba(239, 68, 68, 0.3)',
-                        '#FACC15', '#FACC15', 'rgba(239, 68, 68, 0.3)', '#374151', '#374151', 'rgba(239, 68, 68, 0.3)']
+        e_split = norm(e_tr, e_in, e_bu)
+        m_split = norm(m_tr, m_in, m_bu)
 
-        fig_s1 = go.Figure(data=[go.Sankey(
-            node=dict(pad=20, thickness=25, label=nodes1, color=colors1),
-            link=dict(source=[0,0,1,1,1,2,2,2,3,3,3], target=[2,6,2,3,6,4,5,6,4,5,6], 
-                      value=[elec_from_electro, w_el, elec_from_thermal, f_mol, w_th+w_mol, el_w*0.68, el_h*0.91, el_w*0.32+el_h*0.09, mol_w*0.29, mol_h*0.64, mol_w*0.71+mol_h*0.36],
-                      color=link_colors1)
-        )])
-        fig_s1.update_layout(height=450, margin=dict(t=20, b=20))
-        st.plotly_chart(fig_s1, use_container_width=True)
+        # --- Bilancio per fonte ---
+        pe = {f: r_tes.loc[r_tes['Fuel'] == f, 'EJ'].sum() for f in color_map}
+        el = {f: elec_mix_rows.loc[elec_mix_rows['Fuel'] == f, 'TWh'].sum() * TWH_TO_EJ for f in color_map}
+
+        to_power, conv_loss, direct = {}, {}, {}
+        for f in color_map:
+            e = el[f]
+            if f in ('Hydro', 'Solar', 'Wind', 'Other'):
+                inp = e
+            elif f in ('Nuclear', 'Biomass/Geo'):
+                inp = max(pe[f], e)
+            elif f in eta:
+                inp = min(pe[f], e / eta[f]) if e > 0 else 0.0
+                inp = max(inp, e)
+            else:
+                inp = 0.0
+            to_power[f] = inp
+            conv_loss[f] = inp - e
+            direct[f] = max(0.0, pe[f] - inp) if f not in ('Hydro', 'Solar', 'Wind', 'Other') else 0.0
+
+        E_gen = sum(el.values())
+        E_grid_loss = E_gen * grid_loss
+        E_fin = E_gen - E_grid_loss
+        M_dir = sum(direct.values())
+        M_up_loss = M_dir * mol_up_loss
+        M_fin = M_dir - M_up_loss
+        M_nonen = M_fin * non_energy
+        M_energy = M_fin - M_nonen
+
+        el_w, el_h = E_fin * el_work_share, E_fin * (1 - el_work_share)
+        mol_w, mol_h = M_energy * mol_work_share, M_energy * (1 - mol_work_share)
+        useful_work = el_w * el_work_eff + mol_w * mol_work_eff
+        useful_heat = el_h * el_heat_eff + mol_h * mol_heat_eff
+        end_loss = max(0.0, el_w * (1 - el_work_eff) + el_h * (1 - el_heat_eff)) + mol_w * (1 - mol_work_eff) + mol_h * (1 - mol_heat_eff)
+        # con pompe di calore (COP>1) il calore ambiente entra come input aggiuntivo
+        ambient = max(0.0, el_h * (el_heat_eff - 1))
+
+        total_in = sum(pe.values()) + el['Other']
+        tot_loss = sum(conv_loss.values()) + E_grid_loss + M_up_loss + end_loss
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Energia utile / primaria", f"{(useful_work + useful_heat) / total_in * 100:.0f}%")
+        k2.metric("Perdite totali", f"{tot_loss:.1f} EJ", f"{tot_loss / total_in * 100:.0f}% della primaria", delta_color="off")
+        k3.metric("Perdite nelle centrali", f"{sum(conv_loss.values()):.1f} EJ")
+        k4.metric("Quota elettrica negli usi finali", f"{E_fin / (E_fin + M_fin) * 100:.0f}%" if (E_fin + M_fin) else "n.d.")
+
+        # --- 1. SANKEY: primaria -> vettori -> energia utile ---
+        st.subheader("1. Dalla primaria all'energia utile")
+        st.caption("Fonti raggruppate. Colonna centrale: elettricità generata, combustibili usati direttamente "
+                   "e perdite di trasformazione nelle centrali. A destra: servizio energetico effettivamente reso.")
+        groups = [
+            ('Idro, solare, eolico', ['Hydro', 'Solar', 'Wind'], '#16A34A'),
+            ('Altro (pompaggi, rifiuti)', ['Other'], '#9CA3AF'),
+            ('Fossili', ['Coal', 'Oil', 'Natural Gas'], '#374151'),
+            ('Biomasse, geo, biocarburanti', ['Biomass/Geo', 'Biofuels'], color_map['Biomass/Geo']),
+            ('Nucleare', ['Nuclear'], color_map['Nuclear']),
+        ]
+        sb = SankeyBuilder(total_in)
+        for i, (name, fuels, colr) in enumerate(groups):
+            sb.node(name, name, colr, 0, i)
+            sb.link(name, 'elec', sum(el[f] for f in fuels), rgba(colr, 0.45))
+            sb.link(name, 'mol', sum(direct[f] for f in fuels), rgba(colr, 0.45))
+            sb.link(name, 'conv', sum(conv_loss[f] for f in fuels), rgba(LOSS, 0.35))
+        sb.node('elec', 'Elettricità', ELEC, 1, 0)
+        sb.node('ambient', 'Calore ambiente (pompe di calore)', '#60A5FA', 1, 1)
+        sb.node('mol', 'Combustibili (uso diretto)', MOL, 1, 2)
+        sb.node('conv', 'Perdite nelle centrali', LOSS, 1, 3)
+        sb.node('work', 'Lavoro utile (moto, servizi)', '#2563EB', 2, 0)
+        sb.node('heat', 'Calore utile', '#F97316', 2, 1)
+        sb.node('nonen', 'Usi non energetici (materia)', '#A8A29E', 2, 2)
+        sb.node('loss2', 'Perdite a valle (rete, filiera, usi finali)', LOSS, 2, 3)
+        sb.link('elec', 'loss2', E_grid_loss + el_w * (1 - el_work_eff) + el_h * max(0.0, 1 - el_heat_eff), rgba(LOSS, 0.35))
+        sb.link('elec', 'work', el_w * el_work_eff, rgba(ELEC, 0.5))
+        sb.link('elec', 'heat', el_h * min(el_heat_eff, 1.0), rgba(ELEC, 0.5))
+        sb.link('ambient', 'heat', ambient, rgba('#60A5FA', 0.4))
+        sb.link('mol', 'loss2', M_up_loss + mol_w * (1 - mol_work_eff) + mol_h * (1 - mol_heat_eff), rgba(LOSS, 0.35))
+        sb.link('mol', 'work', mol_w * mol_work_eff, rgba(MOL, 0.45))
+        sb.link('mol', 'heat', mol_h * mol_heat_eff, rgba(MOL, 0.45))
+        sb.link('mol', 'nonen', M_nonen, rgba(MOL, 0.3))
+        st.plotly_chart(sb.figure(520, 3), width='stretch')
 
         st.divider()
 
-        # --- 2. SANKEY SETTORIALE (Primaria -> Fonti -> Settori) ---
-        st.subheader("2. Flusso Primaria -> Settori Finali")
-        st.markdown("I flussi verso i settori sono stime proxy (Modello Ember). **Colori:** Elettricità (Giallo), Fossili (Nero), Perdite Termodinamiche (Rosso).")
-        
-        # Stima input termici per la generazione
-        in_coal_el = el_coal / eff_th if el_coal > 0 else 0
-        in_gas_el = el_gas / eff_th if el_gas > 0 else 0
-        in_oil_el = el_oil / eff_th if el_oil > 0 else 0
-        in_nuc_el = el_nuc / eff_th if el_nuc > 0 else 0
-        in_bio_el = el_bio / eff_th if el_bio > 0 else 0
-        
-        # Molecole dirette
-        dir_coal = max(0, pe_coal - in_coal_el)
-        dir_gas = max(0, pe_gas - in_gas_el)
-        dir_oil = max(0, pe_oil - in_oil_el)
-        dir_bio = max(0, pe_bio - in_bio_el)
-        
-        tot_dir = dir_coal + dir_gas + dir_oil + dir_bio
-        
-        nodes2 = ["Carbone", "Gas", "Petrolio", "Nucleare", "Biomasse", "Idro", "Solare", "Eolico", 
-                  "Elettricità", "Molecole Dirette", "Trasporti", "Industria", "Edifici/Civile", "Perdite Termodinamiche"]
-        
-        colors2 = [color_map['Coal'], color_map['Natural Gas'], color_map['Oil'], color_map['Nuclear'], color_map['Biomass/Geo'], 
-                   color_map['Hydro'], color_map['Solar'], color_map['Wind'], 
-                   '#FACC15', '#4B5563', '#3B82F6', '#F97316', '#10B981', 'rgba(239, 68, 68, 0.5)']
-        
-        src2 = [0,1,2,3,4,5,6,7, 0,1,2,4, 8,8,8, 8, 9,9,9]
-        tgt2 = [8,8,8,8,8,8,8,8, 9,9,9,9, 10,11,12, 13, 10,11,12]
-        
-        val2 = [
-            el_coal, el_gas, el_oil, el_nuc, el_bio, el_hydro, el_solar, el_wind,
-            dir_coal, dir_gas, dir_oil, dir_bio,
-            el_tot * 0.05, el_tot * 0.45, el_tot * 0.50,
-            (in_coal_el+in_gas_el+in_oil_el+in_nuc_el+in_bio_el) - (el_coal+el_gas+el_oil+el_nuc+el_bio) + w_el,
-            tot_dir * 0.50, tot_dir * 0.30, tot_dir * 0.20
-        ]
-        
-        link_colors2 = [
-            '#FACC15', '#FACC15', '#FACC15', '#FACC15', '#FACC15', '#FACC15', '#FACC15', '#FACC15',
-            '#374151', '#374151', '#374151', '#374151',
-            '#FACC15', '#FACC15', '#FACC15', 'rgba(239, 68, 68, 0.4)',
-            '#374151', '#374151', '#374151'
-        ]
-
-        fig_s2 = go.Figure(data=[go.Sankey(
-            node=dict(pad=15, thickness=20, label=nodes2, color=colors2),
-            link=dict(source=src2, target=tgt2, value=val2, color=link_colors2, hovertemplate='%{value:.1f} EJ<extra></extra>')
-        )])
-        fig_s2.update_layout(height=600, margin=dict(t=20, b=20))
-        st.plotly_chart(fig_s2, use_container_width=True)
+        # --- 2. SANKEY: fonti -> vettori -> settori ---
+        st.subheader("2. Dalle fonti ai settori finali")
+        st.caption("Fonti in dettaglio. Le perdite nelle centrali partono dalla fonte che le genera; "
+                   "la ripartizione per settore è un'ipotesi (vedi ⚙️).")
+        order = ['Hydro', 'Wind', 'Solar', 'Other', 'Oil', 'Biofuels', 'Natural Gas', 'Coal', 'Biomass/Geo', 'Nuclear']
+        sb2 = SankeyBuilder(total_in)
+        for i, f in enumerate(order):
+            sb2.node(f, fuel_it[f], color_map[f], 0, i)
+            sb2.link(f, 'elec', el[f], rgba(color_map[f], 0.5))
+            sb2.link(f, 'mol', direct[f], rgba(color_map[f], 0.5))
+            sb2.link(f, 'conv', conv_loss[f], rgba(LOSS, 0.35))
+        sb2.node('elec', 'Elettricità', ELEC, 1, 0)
+        sb2.node('mol', 'Combustibili (uso diretto)', MOL, 1, 1)
+        sb2.node('conv', 'Perdite nelle centrali', LOSS, 1, 2)
+        sb2.node('dist', 'Perdite di rete e filiera', LOSS, 2, 5)
+        sb2.link('elec', 'dist', E_grid_loss, rgba(LOSS, 0.35))
+        sb2.link('mol', 'dist', M_up_loss, rgba(LOSS, 0.35))
+        # e_split / m_split sono nell'ordine Trasporti, Industria, Edifici
+        sectors = [(2, 'bu', 'Edifici/Civile', '#10B981'), (1, 'in', 'Industria', '#F97316'), (0, 'tr', 'Trasporti', '#3B82F6')]
+        for pos, (j, k, name, colr) in enumerate(sectors):
+            sb2.node(k, name, colr, 2, pos)
+            sb2.link('elec', k, E_fin * e_split[j], rgba(ELEC, 0.5))
+            sb2.link('mol', k, M_energy * m_split[j], rgba(MOL, 0.45))
+        sb2.node('nonen', 'Usi non energetici (materia)', '#A8A29E', 2, 3)
+        sb2.link('mol', 'nonen', M_nonen, rgba(MOL, 0.3))
+        st.plotly_chart(sb2.figure(650, 3), width='stretch')
